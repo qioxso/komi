@@ -1,0 +1,36 @@
+name: Build Kernel Module
+
+on:
+  push:
+    branches:
+      - '*'         # 匹配所有分支
+      - '!main'      # 排除 main 分支，因为 main 只负责分发
+  workflow_dispatch: # 允许手动点击触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Extract KMI Version
+        id: kmi_getter
+        run: |
+          # 从 devcontainer.json 中提取镜像名作为 KMI 版本
+          KMI=$(jq -r '.image' .devcontainer/devcontainer.json | cut -d':' -f2)
+          echo "kmi=$KMI" >> $GITHUB_OUTPUT
+
+      - name: Build Module
+        # 使用你之前提到的 DDK 容器环境
+        run: |
+          docker run --privileged -v ${{ github.workspace }}:/src -w /src \
+          ghcr.io/ylarod/ddk:${{ steps.kmi_getter.outputs.kmi }} \
+          /bin/bash -c "make KDIR=\$KERNEL_SRC"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shami-ko-files
+          path: |
+            *.ko
