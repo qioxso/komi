@@ -18,9 +18,9 @@
 #include <linux/wait.h>
 #include <linux/poll.h>
 #include <linux/kfifo.h>
-// --- 硬件断点头文件 ---
 #include <linux/perf_event.h>
 #include <linux/hw_breakpoint.h>
+#include <linux/ptrace.h>
 
 #include "comm.h"
 
@@ -28,15 +28,14 @@
 #define MAX_LOG_SIZE 4096
 #define RING_BUF_SIZE (1024 * 64)
 
-// 全局日志缓冲区
 static struct kfifo log_fifo;
 static spinlock_t log_lock;
 static wait_queue_head_t log_waitbuf;
 
-// --- 辅助函数：格式化并写入日志 ---
+// --- 辅助日志函数 ---
 static void log_to_user(const char* fmt, ...) {
     va_list args;
-    char buf[512]; // 单条日志最大长度
+    char buf[512];
     unsigned long flags;
     int len;
 
@@ -44,65 +43,39 @@ static void log_to_user(const char* fmt, ...) {
     len = vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
-    // 1. dmesg 打印
-    // printk(KERN_INFO "[Shami] %s", buf); 
+    // 调试用：强制输出到 dmesg
+    printk(KERN_INFO "[Shami_DBG] %s", buf);
 
-    // 2. 写入用户态缓冲区
     spin_lock_irqsave(&log_lock, flags);
     if (kfifo_avail(&log_fifo) > len) {
         kfifo_in(&log_fifo, buf, len);
     }
     spin_unlock_irqrestore(&log_lock, flags);
-    
     wake_up_interruptible(&log_waitbuf);
 }
 
-// =========================================================
-// --- 内存读写功能 (Read/Write Memory) ---
-// =========================================================
+// --- 内存读写 ---
 static int read_memory_force(struct mm_struct *mm, unsigned long addr, void *buffer, size_t size) {
-    struct page *page;
-    void *maddr;
-    int res;
-    size_t bytes_read = 0;
-    
+    struct page *page; void *maddr; int res; size_t bytes_read = 0;
     while (bytes_read < size) {
         size_t offset = (addr + bytes_read) & ~PAGE_MASK;
         size_t bytes_to_copy = min(size - bytes_read, PAGE_SIZE - offset);
-
         res = get_user_pages_remote(mm, addr + bytes_read, 1, FOLL_FORCE, &page, NULL, NULL);
         if (res <= 0) return -1;
-
-        maddr = kmap_atomic(page);
-        memcpy(buffer + bytes_read, maddr + offset, bytes_to_copy);
-        kunmap_atomic(maddr);
-        
-        put_page(page);
-        bytes_read += bytes_to_copy;
+        maddr = kmap_atomic(page); memcpy(buffer + bytes_read, maddr + offset, bytes_to_copy);
+        kunmap_atomic(maddr); put_page(page); bytes_read += bytes_to_copy;
     }
     return 0;
 }
-
 static int write_memory_force(struct mm_struct *mm, unsigned long addr, void *data, size_t size) {
-    struct page *page;
-    void *maddr;
-    int res;
-    size_t bytes_written = 0;
-
+    struct page *page; void *maddr; int res; size_t bytes_written = 0;
     while (bytes_written < size) {
         size_t offset = (addr + bytes_written) & ~PAGE_MASK;
         size_t bytes_to_copy = min(size - bytes_written, PAGE_SIZE - offset);
-
         res = get_user_pages_remote(mm, addr + bytes_written, 1, FOLL_WRITE | FOLL_FORCE, &page, NULL, NULL);
         if (res <= 0) return -1;
-
-        maddr = kmap_atomic(page);
-        memcpy(maddr + offset, data + bytes_written, bytes_to_copy);
-        kunmap_atomic(maddr);
-        
-        set_page_dirty_lock(page);
-        put_page(page);
-        bytes_written += bytes_to_copy;
+        maddr = kmap_atomic(page); memcpy(maddr + offset, data + bytes_written, bytes_to_copy);
+        kunmap_atomic(maddr); set_page_dirty_lock(page); put_page(page); bytes_written += bytes_to_copy;
     }
     return 0;
 }
@@ -135,6 +108,9 @@ static int add_watchpoint(WATCHPOINT_CONFIG *wc) {
     struct my_watchpoint_ctx *ctx;
     int ret = 0;
 
+    // 调试信息：查看传入参数
+    printk(KERN_INFO "[Shami_DBG] Add WP: TID=%d, Addr=0x%lx, Type=%d\n", wc->pid, wc->addr, wc->type);
+
     pid_struct = find_get_pid(wc->pid);
     if (!pid_struct) return -ESRCH;
     task = get_pid_task(pid_struct, PIDTYPE_PID);
@@ -154,7 +130,9 @@ static int add_watchpoint(WATCHPOINT_CONFIG *wc) {
     
     if (IS_ERR(bp)) {
         ret = PTR_ERR(bp);
-        printk(KERN_ERR "[Shami] Register HWBP failed: %d\n", ret);
+        printk(KERN_ERR "[Shami_DBG] Register FAILED! Err: %d\n", ret);
+        if(ret == -22) printk(KERN_ERR "[Shami_DBG] Check Alignment! Addr must be 4-byte aligned.\n");
+        if(ret == -28) printk(KERN_ERR "[Shami_DBG] No Debug Registers left.\n");
         put_task_struct(task);
         return ret;
     }
@@ -173,7 +151,7 @@ static int add_watchpoint(WATCHPOINT_CONFIG *wc) {
     list_add(&ctx->list, &watchpoint_list);
     mutex_unlock(&watchpoint_lock);
 
-    log_to_user("[Shami] Watchpoint ADDED at 0x%lx (PID: %d)\n", wc->addr, wc->pid);
+    // log_to_user("[Shami] Watchpoint ADDED at 0x%lx (TID: %d)\n", wc->addr, wc->pid);
     put_task_struct(task);
     return 0;
 }
@@ -193,8 +171,6 @@ static int del_watchpoint(pid_t pid, uintptr_t addr) {
         }
     }
     mutex_unlock(&watchpoint_lock);
-    
-    if (found) log_to_user("[Shami] Watchpoint REMOVED at 0x%lx\n", addr);
     return found ? 0 : -ENOENT;
 }
 
@@ -210,7 +186,7 @@ static void clean_all_watchpoints(void) {
 }
 
 // =========================================================
-// --- Uprobes 功能 (Hook / Monitor) ---
+// --- Uprobes 功能 ---
 // =========================================================
 struct my_uprobe_ctx {
     struct list_head list;
@@ -227,32 +203,11 @@ struct my_uprobe_ctx {
 static LIST_HEAD(uprobe_list);
 static DEFINE_MUTEX(uprobe_lock);
 
-static void format_user_stack(char *buf, int buf_len, struct pt_regs *regs) {
-    unsigned long fp = regs->regs[29];
-    unsigned long stack_content[2]; 
-    int depth = 0;
-    int used = strlen(buf);
-
-    while (depth < 8 && fp != 0 && used < buf_len - 64) {
-        if (fp & 0x7 || fp > 0x7ffffffff000) break;
-        if (copy_from_user(stack_content, (void __user *)fp, sizeof(stack_content))) break;
-
-        unsigned long next_fp = stack_content[0];
-        unsigned long lr = stack_content[1];
-        used += snprintf(buf + used, buf_len - used, "  #%02d LR: 0x%llx\n", depth, lr);
-
-        if (next_fp == fp) break;
-        fp = next_fp;
-        depth++;
-    }
-}
-
 static int my_uprobe_handler(struct uprobe_consumer *con, struct pt_regs *regs) {
     struct my_uprobe_ctx *ctx = container_of(con, struct my_uprobe_ctx, consumer);
     char *log_buf = NULL;
     int i;
 
-    // 1. 修改寄存器
     if (ctx->flags & FLAG_MODIFY_REG) {
         for (i = 0; i < ctx->mod_count; i++) {
             int idx = ctx->mods[i].reg_index;
@@ -263,24 +218,19 @@ static int my_uprobe_handler(struct uprobe_consumer *con, struct pt_regs *regs) 
         }
     }
 
-    // 2. 日志捕获
     if (ctx->flags & (FLAG_ENABLE_LOG | FLAG_ENABLE_PRINTK)) {
         log_buf = kzalloc(MAX_LOG_SIZE, GFP_ATOMIC);
         if (log_buf) {
             int pos = 0;
             pos += snprintf(log_buf, MAX_LOG_SIZE, "\n[UPROBE] PID:%d Addr:0x%lx\n", ctx->pid, ctx->vaddr);
             pos += snprintf(log_buf + pos, MAX_LOG_SIZE - pos, "  PC : %016llx | SP : %016llx\n", regs->pc, regs->sp);
-            for (i = 0; i <= 4; i++) { // 只打前5个寄存器省空间
+            for (i = 0; i <= 4; i++) { 
                 pos += snprintf(log_buf + pos, MAX_LOG_SIZE - pos, "  X%d: %016llx", i, regs->regs[i]);
             }
             snprintf(log_buf + pos, MAX_LOG_SIZE - pos, "\n");
-            
-            // 简单堆栈
-            // format_user_stack(log_buf, MAX_LOG_SIZE, regs); // 可能会卡，视情况开启
 
             if (ctx->flags & FLAG_ENABLE_PRINTK) printk(KERN_INFO "%s", log_buf);
             if (ctx->flags & FLAG_ENABLE_LOG) log_to_user("%s", log_buf);
-            
             kfree(log_buf);
         }
     }
@@ -297,9 +247,10 @@ static int resolve_addr_to_inode_offset(pid_t pid, unsigned long vaddr, struct i
     pid_struct = find_get_pid(pid);
     if (!pid_struct) return -ESRCH;
     task = get_pid_task(pid_struct, PIDTYPE_PID);
-    if (!task) { put_pid(pid_struct); return -ESRCH; }
+    put_pid(pid_struct);
+    if (!task) return -ESRCH;
     mm = get_task_mm(task);
-    if (!mm) { put_task_struct(task); put_pid(pid_struct); return -EINVAL; }
+    if (!mm) { put_task_struct(task); return -EINVAL; }
 
     mmap_read_lock(mm);
     vma = find_vma(mm, vaddr);
@@ -312,7 +263,6 @@ static int resolve_addr_to_inode_offset(pid_t pid, unsigned long vaddr, struct i
     mmap_read_unlock(mm);
     mmput(mm);
     put_task_struct(task);
-    put_pid(pid_struct);
     return ret;
 }
 
@@ -378,9 +328,7 @@ static void clean_all_uprobes(void) {
     mutex_unlock(&uprobe_lock);
 }
 
-// =========================================================
-// --- 驱动入口 (IOCTL) ---
-// =========================================================
+// --- IOCTL ---
 static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     COPY_MEMORY cm;
     UPROBE_CONFIG uc;
@@ -392,7 +340,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
     struct pid *pid_struct;
     struct mm_struct *mm;
 
-    // 预处理数据拷贝
     if (cmd == OP_READ_MEM || cmd == OP_WRITE_MEM) {
         if (copy_from_user(&cm, (void __user *)arg, sizeof(cm))) return -EFAULT;
         kbuf = kmalloc(cm.size, GFP_KERNEL);
@@ -410,6 +357,7 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
+                put_pid(pid_struct);
                 if (task) {
                     mm = get_task_mm(task);
                     if (mm) {
@@ -420,7 +368,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                     }
                     put_task_struct(task);
                 }
-                put_pid(pid_struct);
             }
             break;
 
@@ -429,6 +376,7 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
             pid_struct = find_get_pid(cm.pid);
             if (pid_struct) {
                 task = get_pid_task(pid_struct, PIDTYPE_PID);
+                put_pid(pid_struct);
                 if (task) {
                     mm = get_task_mm(task);
                     if (mm) {
@@ -438,7 +386,6 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
                     }
                     put_task_struct(task);
                 }
-                put_pid(pid_struct);
             }
             break;
 
@@ -450,18 +397,13 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
         case OP_GET_LOG: {
             ret = wait_event_interruptible(log_waitbuf, !kfifo_is_empty(&log_fifo));
             if (ret != 0) break;
-            
             kbuf = kmalloc(lb.size, GFP_KERNEL);
             if (!kbuf) { ret = -ENOMEM; break; }
-
             spin_lock_irq(&log_lock);
             int copied = kfifo_out(&log_fifo, kbuf, lb.size);
             spin_unlock_irq(&log_lock);
-
             if (copy_to_user(lb.buffer, kbuf, copied)) ret = -EFAULT;
-            else {
-                if (put_user(copied, &((LOG_BUFFER __user *)arg)->read_bytes)) ret = -EFAULT;
-            }
+            else { if (put_user(copied, &((LOG_BUFFER __user *)arg)->read_bytes)) ret = -EFAULT; }
         } break;
     }
 
@@ -474,35 +416,28 @@ static struct file_operations fops = {
     .unlocked_ioctl = shami_ioctl,
     .compat_ioctl = shami_ioctl,
 };
-
 static int major;
 static struct class *shami_class;
-
 static int __init shami_init(void) {
     if (kfifo_alloc(&log_fifo, RING_BUF_SIZE, GFP_KERNEL)) return -ENOMEM;
     spin_lock_init(&log_lock);
     init_waitqueue_head(&log_waitbuf);
-
     major = register_chrdev(0, DEVICE_NAME, &fops);
     if (major < 0) { kfifo_free(&log_fifo); return major; }
     shami_class = class_create(THIS_MODULE, DEVICE_NAME);
     device_create(shami_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
-    
-    printk(KERN_INFO "[Shami] Driver Loaded (RW/Uprobe/Watchpoint).\n");
+    printk(KERN_INFO "[Shami] Debug Driver Loaded.\n");
     return 0;
 }
-
 static void __exit shami_exit(void) {
+    clean_all_watchpoints();
     clean_all_uprobes();
-    clean_all_watchpoints(); // 记得清理断点
-    
     device_destroy(shami_class, MKDEV(major, 0));
     class_destroy(shami_class);
     unregister_chrdev(major, DEVICE_NAME);
     kfifo_free(&log_fifo);
     printk(KERN_INFO "[Shami] Driver Unloaded.\n");
 }
-
 module_init(shami_init);
 module_exit(shami_exit);
 MODULE_LICENSE("GPL");
