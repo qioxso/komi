@@ -14,8 +14,8 @@ enum OPERATIONS {
     OP_INIT_KEY    = 0x800,
     OP_READ_MEM    = 0x801,
     OP_WRITE_MEM   = 0x802,
-    OP_MODULE_BASE = 0x803, // 保留
-    OP_SET_API_ADDR= 0x804, // 保留
+    OP_MODULE_BASE = 0x803, 
+    OP_SET_API_ADDR= 0x804, 
     OP_ADD_UPROBE  = 0x805, // 软件断点 (Hook)
     OP_DEL_UPROBE  = 0x806,
     OP_GET_LOG     = 0x807, // 读取日志
@@ -62,9 +62,9 @@ typedef struct _LOG_BUFFER {
     size_t read_bytes;
 } LOG_BUFFER;
 
-// --- 新增：硬件断点配置 ---
+// 硬件断点配置
 typedef struct _WATCHPOINT_CONFIG {
-    pid_t pid;          // 目标进程PID
+    pid_t pid;          // 目标进程PID (或 TID)
     uintptr_t addr;     // 监控地址
     int type;           // 1=Write(写), 2=Read(读), 3=RW(读写)
     int len;            // 监控长度 (通常为4)
