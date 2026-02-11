@@ -121,9 +121,16 @@ static int add_watchpoint(WATCHPOINT_CONFIG *wc) {
     hw_breakpoint_init(&attr);
     attr.bp_addr = wc->addr;
     attr.bp_len = HW_BREAKPOINT_LEN_4; // 默认监控4字节
-    if (wc->type == 1) attr.bp_type = HW_BREAKPOINT_W;
-    else if (wc->type == 2) attr.bp_type = HW_BREAKPOINT_R;
-    else attr.bp_type = HW_BREAKPOINT_W | HW_BREAKPOINT_R;
+    if (wc->type == 1) {
+        attr.bp_type = HW_BREAKPOINT_W; // 写
+    } else if (wc->type == 2) {
+        attr.bp_type = HW_BREAKPOINT_R; // 读
+    } else if (wc->type == 3) {
+        attr.bp_type = HW_BREAKPOINT_W | HW_BREAKPOINT_R; // 读写
+    } else if (wc->type == 4) {
+        // [新增] 执行断点
+        attr.bp_type = HW_BREAKPOINT_X; 
+    }
 
     // 注册断点
     bp = register_user_hw_breakpoint(&attr, watchpoint_handler, NULL, task);
