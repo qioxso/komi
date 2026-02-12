@@ -21,6 +21,7 @@ enum OPERATIONS {
     OP_GET_LOG     = 0x807, // 读取日志
     OP_ADD_WATCHPOINT = 0x808, // 硬件断点 (Watchpoint)
     OP_DEL_WATCHPOINT = 0x809
+    OP_CLEAN_ALL_WP   = 0x810  // 一键清空所有硬件断点
 };
 
 // 标志位 (Uprobe用)
