@@ -334,6 +334,11 @@ static long shami_ioctl(struct file *file, unsigned int cmd, unsigned long arg) 
         case OP_DEL_UPROBE: ret = del_uprobe(uc.pid, uc.addr); break;
         case OP_ADD_WATCHPOINT: ret = add_watchpoint(&wc); break;
         case OP_DEL_WATCHPOINT: ret = del_watchpoint(wc.pid, wc.addr); break;
+        case OP_CLEAN_ALL_WP: 
+            clean_all_watchpoints(); // 复用驱动里已有的清理函数
+            printk(KERN_INFO "[Shami] All Watchpoints CLEANED by user request.\n");
+            ret = 0; 
+            break;
         case OP_GET_LOG: {
             ret = wait_event_interruptible(log_waitbuf, !kfifo_is_empty(&log_fifo)); if (ret != 0) break;
             kbuf = kmalloc(lb.size, GFP_KERNEL); if (!kbuf) { ret = -ENOMEM; break; }
