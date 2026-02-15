@@ -1,4 +1,4 @@
-name: Build Kernel Module
+name: Build Kernel Module(ko)
 
 on:
   push:
