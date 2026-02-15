@@ -1,0 +1,45 @@
+name: Build Kernel Module
+
+on:
+  push:
+    branches:
+      - '*'          # 匹配所有分支
+      - '!main'      # 排除 main 分支
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      # fail-fast: false 意味着如果其中一个内核构建失败，不会取消其他正在进行的构建
+      fail-fast: false
+      matrix:
+        target:
+          - android12-5.10
+          - android13-5.10
+          - android13-5.15
+          - android14-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Module
+        run: |
+          echo "Building for target: ${{ matrix.target }}"
+          # 直接使用 matrix.target 作为镜像的 tag
+          docker run --privileged -v ${{ github.workspace }}:/src -w /src \
+          ghcr.io/ylarod/ddk:${{ matrix.target }} \
+          /bin/bash -c "make KDIR=\$KERNEL_SRC"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # 修改 Artifact 名称，防止不同版本的文件混在一起
+          name: ko-files-${{ matrix.target }}
+          path: |
+            *.ko
